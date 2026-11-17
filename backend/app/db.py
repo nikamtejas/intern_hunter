@@ -56,6 +56,7 @@ TRACK_STAGES = ["not_applied", "applied", "assessment", "interview", "offer", "r
 APP_COLUMNS = {"user_id": "INTEGER DEFAULT 1", "track": "TEXT DEFAULT 'not_applied'", "applied_at": "REAL", "notes": "TEXT",
                "prep": "TEXT", "followup": "TEXT"}
 USER_COLUMNS = {"password_hash": "TEXT", "salt": "TEXT", "avatar": "TEXT"}
+SEARCH_COLUMNS = {"watch": "INTEGER DEFAULT 0", "last_run": "REAL", "new_ids": "TEXT"}
 SESSION_DAYS = 30
 
 
@@ -72,6 +73,10 @@ def init() -> None:
         for col, decl in APP_COLUMNS.items():
             if col not in have:
                 c.execute(f"ALTER TABLE applications ADD COLUMN {col} {decl}")
+        have_s = {r["name"] for r in c.execute("PRAGMA table_info(searches)")}
+        for col, decl in SEARCH_COLUMNS.items():
+            if col not in have_s:
+                c.execute(f"ALTER TABLE searches ADD COLUMN {col} {decl}")
         have_u = {r["name"] for r in c.execute("PRAGMA table_info(users)")}
         for col, decl in USER_COLUMNS.items():
             if col not in have_u:
@@ -273,15 +278,16 @@ def set_job_description(job_id: str, description: str) -> None:
 def save_search(user_id: int, params: dict, job_ids: list[str], per_source: dict, warnings: list[str]) -> int:
     sid = execute("INSERT INTO searches(user_id,params,job_ids,per_source,warnings,created_at) VALUES(?,?,?,?,?,?)",
                   (user_id, json.dumps(params), json.dumps(job_ids), json.dumps(per_source), json.dumps(warnings), time.time()))
-    # keep the 30 most recent per user
-    execute("""DELETE FROM searches WHERE user_id=? AND id NOT IN
+    # keep the 30 most recent per user (watched searches are always kept)
+    execute("""DELETE FROM searches WHERE user_id=? AND coalesce(watch,0)=0 AND id NOT IN
                (SELECT id FROM searches WHERE user_id=? ORDER BY id DESC LIMIT 30)""", (user_id, user_id))
     return sid
 
 
 def _decode_search(s: dict) -> dict:
-    for k in ("params", "job_ids", "per_source", "warnings"):
-        s[k] = json.loads(s[k] or "null")
+    for k in ("params", "job_ids", "per_source", "warnings", "new_ids"):
+        s[k] = json.loads(s.get(k) or "null")
+    s["new_ids"] = s["new_ids"] or []
     return s
 
 
@@ -289,7 +295,35 @@ def list_searches(user_id: int, limit: int = 12) -> list[dict]:
     rows = [_decode_search(s) for s in query("SELECT * FROM searches WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit))]
     for s in rows:
         s["count"] = len(s.pop("job_ids") or [])
+        s["new_count"] = len(s.pop("new_ids") or [])
     return rows
+
+
+def set_watch(user_id: int, search_id: int, watch: bool) -> None:
+    execute("UPDATE searches SET watch=? WHERE id=? AND user_id=?", (1 if watch else 0, search_id, user_id))
+
+
+def watched_searches(user_id: int | None = None) -> list[dict]:
+    sql, params = "SELECT * FROM searches WHERE watch=1", ()
+    if user_id is not None:
+        sql, params = sql + " AND user_id=?", (user_id,)
+    return [_decode_search(s) for s in query(sql + " ORDER BY id DESC", params)]
+
+
+def record_watch_run(search_id: int, found_ids: list[str]) -> list[str]:
+    """Remember a refresh of a watched search; returns the job ids never seen in it before."""
+    s = _decode_search(query("SELECT * FROM searches WHERE id=?", (search_id,))[0])
+    seen = set(s["job_ids"] or [])
+    fresh = [i for i in found_ids if i not in seen]
+    now = time.time()
+    new_ids = [n for n in s["new_ids"] if now - n["at"] < 7 * 86400] + [{"id": i, "at": now} for i in fresh]
+    execute("UPDATE searches SET job_ids=?, new_ids=?, last_run=? WHERE id=?",
+            (json.dumps((fresh + list(s["job_ids"] or []))[:600]), json.dumps(new_ids[-150:]), now, search_id))
+    return fresh
+
+
+def clear_new(user_id: int) -> None:
+    execute("UPDATE searches SET new_ids='[]' WHERE user_id=?", (user_id,))
 
 
 def get_search(user_id: int, search_id: int) -> dict | None:

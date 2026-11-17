@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { api, Me, setSignedOutHandler, User } from "./api";
+import { api, applyTheme, Me, savedTheme, setSignedOutHandler, Theme, User } from "./api";
 import { Icon, Spinner, ToastProvider, useToast } from "./ui";
 import HomePage from "./pages/HomePage";
 import SearchPage from "./pages/SearchPage";
@@ -11,14 +11,17 @@ import SettingsPage from "./pages/SettingsPage";
 
 export type Tab = "home" | "search" | "studio" | "profile" | "applications" | "tracker" | "settings";
 
-const NAV: [Tab, string, string][] = [
-  ["home", "Home", "home"],
-  ["search", "Find internships", "search"],
-  ["applications", "My resumes", "file"],
-  ["tracker", "Tracker", "board"],
-  ["studio", "Resume Studio", "studio"],
-  ["profile", "My profile", "user"],
+// [tab, label, icon, what it's for — shown as a tooltip]
+const NAV: [Tab, string, string, string][] = [
+  ["home", "Today", "home", "What to do next, and new internships for you"],
+  ["search", "Find internships", "search", "Search India and Europe; star a search to watch it"],
+  ["applications", "My resumes", "file", "Your tailored resumes, ATS reports and interview prep"],
+  ["tracker", "Tracker", "board", "Where every application stands — click one for its journey"],
+  ["studio", "Resume Studio", "studio", "Get any resume reviewed and improved"],
+  ["profile", "My profile", "user", "The facts every resume is built from"],
 ];
+
+applyTheme(savedTheme());
 
 export default function App() {
   return (
@@ -116,10 +119,24 @@ function Shell({ me, setMe }: { me: Me; setMe: (m: Me | null) => void }) {
   const [groqOk, setGroqOk] = useState<boolean | null>(null);
   const [openApp, setOpenApp] = useState<number | null>(null);
   const [running, setRunning] = useState(0);
+  const [badges, setBadges] = useState({ fresh: 0, followups: 0 });
+  const [theme, setTheme] = useState<Theme>(savedTheme());
 
   useEffect(() => {
     api.settings().then((s) => setGroqOk(!!s.groq_configured)).catch(() => setGroqOk(false));
   }, [tab]);
+
+  // live badges + "(3) Intern Hunter" in the browser tab, so a background tab still tells you something happened
+  const refreshBadges = () => api.today().then((t) => setBadges({ fresh: t.new_total, followups: t.followups_due })).catch(() => {});
+  useEffect(() => {
+    refreshBadges();
+    const i = setInterval(refreshBadges, 60_000);
+    return () => clearInterval(i);
+  }, [me.id]);
+  useEffect(() => {
+    const n = badges.fresh + badges.followups;
+    document.title = n ? `(${n}) Intern Hunter` : "Intern Hunter";
+  }, [badges]);
 
   useEffect(() => {
     const tick = () => api.apps().then((a) => setRunning(a.filter((x) => x.status === "queued" || x.status === "running").length)).catch(() => {});
@@ -146,15 +163,23 @@ function Shell({ me, setMe }: { me: Me; setMe: (m: Me | null) => void }) {
         </div>
         <AccountMenu me={me} setMe={setMe} />
         <nav>
-          {NAV.map(([k, label, icon]) => (
-            <button key={k} className={tab === k ? "active" : ""} onClick={() => go(k)}>
+          {NAV.map(([k, label, icon, hint]) => (
+            <button key={k} className={tab === k ? "active" : ""} onClick={() => go(k)} title={hint}>
               <Icon name={icon} />
               <span>{label}</span>
-              {k === "applications" && running > 0 && <em className="pulse">{running}</em>}
+              {k === "applications" && running > 0 && <em className="pulse" title="Resumes being written">{running}</em>}
+              {k === "home" && badges.fresh > 0 && <em className="new" title="New internships">{badges.fresh}</em>}
+              {k === "tracker" && badges.followups > 0 && <em className="warn" title="Follow-ups due">{badges.followups}</em>}
             </button>
           ))}
         </nav>
         <div className="sidebar-foot">
+          <div className="theme-toggle" role="group" aria-label="Theme">
+            {([["light", "sun"], ["system", "settings"], ["dark", "moon"]] as const).map(([k, ic]) => (
+              <button key={k} className={theme === k ? "on" : ""} title={k === "system" ? "Follow system" : `${k} mode`}
+                      onClick={() => { setTheme(k); applyTheme(k); }}><Icon name={ic} size={15} /></button>
+            ))}
+          </div>
           <button className={tab === "settings" ? "active" : ""} onClick={() => go("settings")}>
             <Icon name="settings" />
             <span>Settings</span>
@@ -168,7 +193,7 @@ function Shell({ me, setMe }: { me: Me; setMe: (m: Me | null) => void }) {
       {/* key: everything below re-mounts (and re-fetches) when the profile changes */}
       <main className="content" key={me.id}>
         {!me.locked && <div className="lock-nudge"><Icon name="key" size={15} /> Anyone on this computer can open “{me.name}”. Set a password from the account menu (top left) to keep it private.</div>}
-        {tab === "home" && <HomePage go={go} groqOk={!!groqOk} />}
+        {tab === "home" && <HomePage go={go} groqOk={!!groqOk} name={me.name} onSeen={refreshBadges} />}
         {tab === "search" && <SearchPage onGenerated={() => go("applications")} openApp={(id) => go("applications", id)} />}
         {tab === "studio" && <StudioPage openApp={(id) => go("applications", id)} />}
         {tab === "profile" && <ProfilePage />}

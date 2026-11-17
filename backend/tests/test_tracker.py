@@ -358,3 +358,33 @@ def test_goal_streak_followups_fit_and_prep():
             out = c.post(f"/api/applications/{ids[0]}/prep").json()
         assert out["brush_up"][0]["skill"] == "Tableau"
         assert c.get(f"/api/applications/{ids[0]}").json()["prep"]["questions"][0]["question"] == "SQL joins?"
+
+
+def test_today_missions_and_watched_search_feed():
+    from app.main import app
+
+    with TestClient(app) as c:
+        uid = c.post("/api/users", json={"name": "Today user", "password": "today-pw-1"}).json()["id"]
+        c.put("/api/profile", json={"name": "Today user", "skills": {"technical": ["Python", "SQL"]}})
+        t = c.get("/api/today").json()
+        kinds = [m["kind"] for m in t["missions"]]
+        assert "profile" in kinds and "goal" in kinds and "watch" in kinds and t["new_total"] == 0
+
+        jobs = [c.post("/api/jobs/manual", json={"title": f"Data Intern {i}", "company": f"Co{i}", "country": "india",
+                                                "description": "Python and SQL internship. " * 4}).json() for i in range(3)]
+        sid = db.save_search(uid, {"country": "india", "time_range": "week"}, [jobs[0]["id"]], {}, [])
+        assert c.put(f"/api/searches/{sid}/watch", json={"watch": True}).status_code == 200
+        db.record_watch_run(sid, [j["id"] for j in jobs])  # what the background refresher does
+        t = c.get("/api/today").json()
+        assert t["new_total"] == 2 and {j["id"] for j in t["new_jobs"]} == {jobs[1]["id"], jobs[2]["id"]}
+        assert t["new_jobs"][0]["extra"]["fit"]["pct"] == 100
+        assert "watch" not in [m["kind"] for m in t["missions"]]
+
+        # a ready resume that hasn't been sent becomes a mission
+        aid = db.create_application(jobs[1]["id"], {}, uid)
+        db.update_application(aid, status="done", ats={"ats": {"score": 93}, "checks": {"ready": True}})
+        t = c.get("/api/today").json()
+        assert any(m["kind"] == "send" and m["target"] == aid for m in t["missions"])
+        assert jobs[1]["id"] not in {j["id"] for j in t["new_jobs"]}  # already has a resume
+        c.post("/api/today/seen")
+        assert c.get("/api/today").json()["new_total"] == 0

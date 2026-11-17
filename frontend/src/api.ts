@@ -92,7 +92,14 @@ export type Dashboard = {
   events: AppEvent[]; email: EmailConfig; goal: Goal;
   followups: { id: number; job_title: string; job_company: string; days: number }[];
 };
-export type SearchSummary = { id: number; params: { country: string; time_range: string; keywords: string; location: string; work_mode?: string };
+export type Mission = { kind: string; title: string; sub: string; action: "journey" | "app" | "profile" | "search"; target: number | null; urgent: boolean };
+export type Today = {
+  missions: Mission[]; goal: Goal; profile_score: number; new_jobs: Job[]; new_total: number;
+  watched: { id: number; params: SearchSummary["params"]; last_run: number | null; new_count: number }[];
+  counts: Record<Track, number>; resumes: number; ready_not_sent: number; followups_due: number; events: AppEvent[];
+};
+export type SearchSummary = { id: number; watch?: number; new_count?: number; last_run?: number | null;
+  params: { country: string; time_range: string; keywords: string; location: string; work_mode?: string };
   per_source: Record<string, number>; count: number; created_at: number };
 
 export type Application = {
@@ -159,10 +166,17 @@ export const api = {
   deleteMe: (user_id: number, password: string) => req("/api/users/me", { method: "DELETE", body: JSON.stringify({ user_id, password }) }),
   prep: (id: number) => req<Prep>(`/api/applications/${id}/prep`, { method: "POST" }),
   followup: (id: number) => req<FollowUp>(`/api/applications/${id}/followup`, { method: "POST" }),
+  today: () => req<Today>("/api/today"),
+  todaySeen: () => req("/api/today/seen", { method: "POST" }),
+  watchSearch: (id: number, watch: boolean) => req<SearchSummary[]>(`/api/searches/${id}/watch`, { method: "PUT", body: JSON.stringify({ watch }) }),
+  refreshSearch: (id: number) => req<{ new: number }>(`/api/searches/${id}/refresh`, { method: "POST" }),
   setGoal: (weekly: number) => req<Goal>("/api/goal", { method: "PUT", body: JSON.stringify({ weekly }) }),
   checkProfile: (country = "") => req<{ score: number; items: CheckItem[] }>(`/api/profile/check?country=${country}`),
   setTrack: (id: number, b: { track?: Track; notes?: string }) =>
-    req<Application>(`/api/applications/${id}/track`, { method: "PATCH", body: JSON.stringify(b) }),
+    req<Application>(`/api/applications/${id}/track`, { method: "PATCH", body: JSON.stringify(b) }).then((a) => {
+      if (b.track === "offer") celebrate();  // you earned it
+      return a;
+    }),
   dashboard: () => req<Dashboard>("/api/dashboard"),
   saveEmail: (b: { address: string; app_password: string; host: string; auto: boolean }) =>
     req<EmailConfig>("/api/email", { method: "PUT", body: JSON.stringify(b) }),
@@ -210,4 +224,40 @@ export function timeAgo(iso: string | null): string {
 export function dateShort(ts: number | null | undefined): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+/** A short burst of confetti (offers, weekly goals). Pure canvas, removed after ~2.5 s; skipped if the user prefers less motion. */
+export function celebrate() {
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const c = document.createElement("canvas");
+  c.className = "confetti";
+  c.width = window.innerWidth;
+  c.height = window.innerHeight;
+  document.body.appendChild(c);
+  const ctx = c.getContext("2d")!;
+  const colors = ["#4f46e5", "#7c3aed", "#16a34a", "#f59e0b", "#ec4899", "#0ea5e9"];
+  const parts = Array.from({ length: 160 }, () => ({
+    x: c.width / 2 + (Math.random() - 0.5) * 200, y: c.height / 3, r: 4 + Math.random() * 5,
+    vx: (Math.random() - 0.5) * 14, vy: -Math.random() * 14 - 4, c: colors[Math.floor(Math.random() * colors.length)], a: Math.random() * 6,
+  }));
+  const t0 = performance.now();
+  const tick = (t: number) => {
+    ctx.clearRect(0, 0, c.width, c.height);
+    for (const p of parts) {
+      p.vy += 0.38; p.x += p.vx; p.y += p.vy; p.a += 0.15;
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c; ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r); ctx.restore();
+    }
+    if (t - t0 < 2600) requestAnimationFrame(tick); else c.remove();
+  };
+  requestAnimationFrame(tick);
+}
+
+export type Theme = "system" | "light" | "dark";
+export function applyTheme(t: Theme) {
+  if (t === "system") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("ih_theme", t); } catch {}
+}
+export function savedTheme(): Theme {
+  try { return (localStorage.getItem("ih_theme") as Theme) || "system"; } catch { return "system"; }
 }

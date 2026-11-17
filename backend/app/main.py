@@ -56,7 +56,7 @@ async def lifespan(_: FastAPI):
     # resume anything left queued from a previous run
     for a in db.query("SELECT id FROM applications WHERE status IN ('queued','running')"):
         queue.put_nowait(a["id"])
-    tasks = [asyncio.create_task(worker()), asyncio.create_task(mailsync.auto_sync_loop())]
+    tasks = [asyncio.create_task(worker()), asyncio.create_task(mailsync.auto_sync_loop()), asyncio.create_task(watch_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -284,6 +284,57 @@ async def search(body: SearchBody, uid: int = Depends(current_user)):
 @app.get("/api/searches")
 def list_searches(uid: int = Depends(current_user)):
     return db.list_searches(uid)
+
+
+WATCH_EVERY = 3 * 3600  # seconds between refreshes of a watched search
+MAX_WATCHED = 3
+
+
+async def refresh_watched(s: dict) -> list[str]:
+    """Re-run a watched search for the last 24h (light on the job sites) and record what's new."""
+    p = s["params"] or {}
+    res = await scrapers.search_all(p.get("country", "india"), "24h", p.get("sources") or list(scrapers.SOURCES),
+                                    p.get("keywords", ""), p.get("location", ""), p.get("work_mode", "any"))
+    return db.record_watch_run(s["id"], [j["id"] for j in res["jobs"]])
+
+
+async def watch_loop() -> None:
+    """Background: keep every watched search fresh while the app is open."""
+    await asyncio.sleep(60)
+    while True:
+        for s in db.watched_searches():
+            if time.time() - (s.get("last_run") or 0) >= WATCH_EVERY:
+                try:
+                    fresh = await refresh_watched(s)
+                    log.info("watched search %s: %d new", s["id"], len(fresh))
+                except Exception as e:
+                    log.warning("watched search %s failed: %s", s["id"], e)
+        await asyncio.sleep(300)
+
+
+class WatchBody(BaseModel):
+    watch: bool
+
+
+@app.put("/api/searches/{search_id}/watch")
+def watch_search(search_id: int, body: WatchBody, uid: int = Depends(current_user)):
+    s = db.get_search(uid, search_id)
+    if not s:
+        raise HTTPException(404, "Search not found")
+    if body.watch and len(db.watched_searches(uid)) >= MAX_WATCHED and not s.get("watch"):
+        raise HTTPException(400, f"You can watch up to {MAX_WATCHED} searches — unwatch one first.")
+    db.set_watch(uid, search_id, body.watch)
+    if body.watch:  # what's there now counts as seen; only later postings are "new"
+        db.execute("UPDATE searches SET last_run=? WHERE id=?", (time.time(), search_id))
+    return db.list_searches(uid)
+
+
+@app.post("/api/searches/{search_id}/refresh")
+async def refresh_search(search_id: int, uid: int = Depends(current_user)):
+    s = db.get_search(uid, search_id)
+    if not s or not s.get("watch"):
+        raise HTTPException(404, "Not a watched search")
+    return {"new": len(await refresh_watched(s))}
 
 
 @app.get("/api/searches/{search_id}")
@@ -667,6 +718,72 @@ def dashboard(uid: int = Depends(current_user)):
         "goal": _goal(apps, uid),
         "followups": _needs_followup(apps, uid),
     }
+
+
+# ------------------------------------------------------------------ "Today": what to do next
+@app.get("/api/today")
+def today(uid: int = Depends(current_user)):
+    apps = list_apps(uid)
+    goal = _goal(apps, uid)
+    followups = _needs_followup(apps, uid)
+    check = completeness.check(db.get_profile(uid) or {})
+    watched = db.watched_searches(uid)
+    mine = {a["job_id"] for a in apps}
+    new_ids, seen_new = [], set()
+    for s in watched:
+        for n in sorted(s["new_ids"], key=lambda n: -n["at"]):
+            if n["id"] not in seen_new and n["id"] not in mine:
+                seen_new.add(n["id"])
+                new_ids.append(n["id"])
+    new_jobs = db.get_jobs(new_ids[:60])
+    _mark_mine(new_jobs, uid)
+    new_jobs.sort(key=lambda j: ((j.get("extra", {}).get("fit") or {}).get("pct", 0), j.get("posted_at") or ""), reverse=True)
+
+    missions: list[dict] = []
+    def add(kind, title, sub, action, target=None, urgent=False):
+        missions.append({"kind": kind, "title": title, "sub": sub, "action": action, "target": target, "urgent": urgent})
+
+    for a in [x for x in apps if x["track"] in ("interview", "assessment")][:3]:
+        if not a.get("has_prep"):
+            add("prep", f"Prepare for {a.get('job_company') or a.get('job_title')}",
+                f"{'Interview' if a['track'] == 'interview' else 'Assessment'} stage — get likely questions and a 7-day plan",
+                "journey", a["id"], True)
+    for f in followups[:3]:
+        add("followup", f"Follow up with {f.get('job_company') or f.get('job_title')}",
+            f"Applied {f['days']} days ago, no reply yet", "journey", f["id"], True)
+    ready = [a for a in apps if a["track"] == "not_applied" and a.get("ready")]
+    for a in ready[:3]:
+        add("send", f"Send your resume to {a.get('job_company') or a.get('job_title')}",
+            f"{a.get('job_title')} · ATS {round(a.get('score') or 0)} · ready to send — mark it applied after", "app", a["id"])
+    high = [i for i in check["items"] if i["severity"] == "high"]
+    if high:
+        add("profile", "Finish your profile", high[0]["message"] + (f" (+{len(high) - 1} more)" if len(high) > 1 else ""), "profile")
+    if goal["this_week"] < goal["weekly"]:
+        add("goal", f"Apply to {goal['weekly'] - goal['this_week']} more this week",
+            f"{goal['this_week']} of {goal['weekly']} done" + (f" · 🔥 protect your {goal['streak']}-week streak" if goal["streak"] else ""), "search")
+    if not watched:
+        add("watch", "Let new internships come to you", "Star a search on Find internships — it re-runs every 3 hours", "search")
+
+    counts = {k: sum(1 for a in apps if a["track"] == k) for k in db.TRACK_STAGES}
+    return {
+        "missions": missions,
+        "goal": goal,
+        "profile_score": check["score"],
+        "new_jobs": new_jobs[:8],
+        "new_total": len(new_ids),
+        "watched": [{"id": s["id"], "params": s["params"], "last_run": s.get("last_run"), "new_count": len(s["new_ids"])} for s in watched],
+        "counts": counts,
+        "resumes": len(apps),
+        "ready_not_sent": len(ready),
+        "followups_due": len(followups),
+        "events": db.list_events(uid, limit=6),
+    }
+
+
+@app.post("/api/today/seen")
+def today_seen(uid: int = Depends(current_user)):
+    db.clear_new(uid)
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ email (auto status updates)

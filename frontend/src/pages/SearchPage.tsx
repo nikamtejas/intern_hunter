@@ -58,6 +58,13 @@ export default function SearchPage({ onGenerated, openApp }: { onGenerated: () =
     }
   }
 
+  async function toggleWatch(sid: number, watch: boolean) {
+    try {
+      setRecent(await api.watchSearch(sid, watch));
+      toast(watch ? "Watching — new internships will appear on Today (checked every 3 hours)" : "Stopped watching");
+    } catch (e: any) { toast(e.message, "err"); }
+  }
+
   async function reopen(sid: number) {
     setLoading(true);
     try {
@@ -158,14 +165,18 @@ export default function SearchPage({ onGenerated, openApp }: { onGenerated: () =
         {recent.length > 0 && (
           <div className="recent-searches">
             <span className="muted small">Your recent searches</span>
-            {recent.slice(0, 8).map((r) => (
-              <button key={r.id} className={`schip ${activeSearch === r.id ? "on" : ""}`} onClick={() => reopen(r.id)}
+            {[...recent].sort((a, b) => (b.watch || 0) - (a.watch || 0)).slice(0, 8).map((r) => (
+              <span key={r.id} className={`schip-wrap ${r.watch ? "watching" : ""}`}>
+              <button className={`star ${r.watch ? "on" : ""}`} title={r.watch ? "Watching — new jobs show up on Today. Click to stop." : "Watch: re-check every 3 hours"}
+                      onClick={() => toggleWatch(r.id, !r.watch)}><Icon name="star" size={14} /></button>
+              <button className={`schip ${activeSearch === r.id ? "on" : ""}`} onClick={() => reopen(r.id)}
                       title={new Date(r.created_at * 1000).toLocaleString()}>
                 {flagOf(r.params.country)} {r.params.keywords || "all internships"}
                 {r.params.work_mode && r.params.work_mode !== "any" ? ` · ${meta?.work_modes[r.params.work_mode]}` : ""}
                 {r.params.location ? ` · ${r.params.location}` : ""} · {RANGE_LABEL[r.params.time_range] || r.params.time_range}
                 <em>{r.count}</em>
               </button>
+              </span>
             ))}
           </div>
         )}
@@ -189,6 +200,10 @@ export default function SearchPage({ onGenerated, openApp }: { onGenerated: () =
               </div>
             </div>
             <div className="row">
+              {activeSearch && !recent.find((r) => r.id === activeSearch)?.watch && (
+                <button className="btn sm" onClick={() => toggleWatch(activeSearch, true)} title="Re-check every 3 hours and show new ones on Today">
+                  <Icon name="star" size={15} /> Watch this search</button>
+              )}
               <div className="field sm"><Icon name="search" size={15} />
                 <input placeholder="Filter results" value={filter} onChange={(e) => setFilter(e.target.value)} />
               </div>
@@ -238,7 +253,10 @@ export default function SearchPage({ onGenerated, openApp }: { onGenerated: () =
       {!loading && jobs.length === 0 && (
         searched
           ? <Empty icon="search" title="No internships found">Try a wider time range, fewer keywords, or leave the city empty.</Empty>
-          : <Empty icon="search" title="Search to get started">Pick a country and time range. Then tick the internships you like and generate tailored resumes in one go.</Empty>
+          : <Empty icon="search" title="Three steps to your next internship">
+              <b>1.</b> Pick a country, Remote/Hybrid if you like, and search. <b>2.</b> Tick the roles you want and hit
+              <b> Generate</b> for tailored resumes. <b>3.</b> Tap ⭐ <b>Watch</b> on the search — new matches then land on
+              <b> Today</b> every few hours.</Empty>
       )}
 
       {selected.size > 0 && (
